@@ -1,0 +1,46 @@
+# ── 데이터 (용량 큼, HuggingFace에서 자동 다운로드) ──
+data/
+!data/.gitkeep
+
+# ── 환경 변수 ──
+.env
+.env.local
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── 가상환경 ──
+venv/
+.venv/
+env/
+
+# ── Streamlit ──
+.streamlit/secrets.toml
+
+# ── SQLite 부산물 ──
+*.db
+*.db-shm
+*.db-wal
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+
+# ── 임시 / 로그 ──
+*.log
+data/analysis_temp*.txt
+
+# ── 이미지 작업 원본 (README용 스크린샷은 docs/images에 커밋) ──
+# 이미지/  # 스크린샷은 포함
