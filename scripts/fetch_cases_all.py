@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
 
-from api_client import BASE_SEARCH_URL, BASE_SERVICE_URL, LawApiClient, build_request_url, parse_xml, save_text
+from api_client import LawApiClient, mask_oc_in_url, parse_xml, save_text_sanitized
 
 ROOT = Path(__file__).resolve().parent.parent
 RAW_DIR = ROOT / "data" / "raw" / "cases_api"
@@ -39,7 +39,7 @@ def load_existing_ids() -> set[str]:
 
 def fetch_case_list(client: LawApiClient, page: int = 1, display: int = 100) -> List[Dict[str, str]]:
     xml_text = client.search("prec", page=page, display=display)
-    save_text(RAW_DIR / f"case-list-page-{page}.xml", xml_text)
+    save_text_sanitized(RAW_DIR / f"case-list-page-{page}.xml", xml_text)
     timestamp = datetime.now(timezone.utc).isoformat()
     root = parse_xml(xml_text)
 
@@ -58,7 +58,7 @@ def fetch_case_list(client: LawApiClient, page: int = 1, display: int = 100) -> 
             "decision_date": text_of(case, "선고일자"),
             "case_type": text_of(case, "사건종류명"),
             "decision_type": text_of(case, "판결유형"),
-            "detail_link": text_of(case, "판례상세링크"),
+            "detail_link": mask_oc_in_url(text_of(case, "판례상세링크")),
             "collected_at": timestamp,
             "source": "open_api",
         })
@@ -67,7 +67,7 @@ def fetch_case_list(client: LawApiClient, page: int = 1, display: int = 100) -> 
 
 def fetch_case_detail(client: LawApiClient, precedent_id: str) -> Dict[str, str]:
     xml_text = client.service("prec", ID=precedent_id)
-    save_text(RAW_DIR / f"case-{precedent_id}.xml", xml_text)
+    save_text_sanitized(RAW_DIR / f"case-{precedent_id}.xml", xml_text)
     timestamp = datetime.now(timezone.utc).isoformat()
     root = parse_xml(xml_text)
     return {

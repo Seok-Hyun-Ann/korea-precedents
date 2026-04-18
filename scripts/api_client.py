@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict
+import re
 from urllib.parse import urlencode
 import xml.etree.ElementTree as ET
 
@@ -15,6 +16,7 @@ BASE_SERVICE_URL = "http://www.law.go.kr/DRF/lawService.do"
 DEFAULT_TYPE = "XML"
 DEFAULT_TIMEOUT = 30
 DEFAULT_SLEEP_SECONDS = 0.5
+PUBLIC_OC_PLACEHOLDER = "YOUR_OC"
 
 
 def _load_oc() -> str:
@@ -83,5 +85,42 @@ def save_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def save_text_sanitized(path: Path, text: str) -> None:
+    """응답 본문에 섞여 오는 OC 파라미터를 치환한 뒤 저장한다.
+
+    법제처 API는 응답 XML 안의 `판례상세링크`·`법령상세링크` 등에 요청 시 사용한
+    OC 값을 그대로 echo한다. 원본 그대로 저장하면 raw 덤프에도 OC가 남으므로,
+    파일로 쓰기 전에 `mask_oc_in_url`의 규칙으로 치환한다.
+    """
+    sanitized = _OC_PARAM_PATTERN.sub(
+        lambda m: f"{m.group(1)}OC={PUBLIC_OC_PLACEHOLDER}", text
+    )
+    save_text(path, sanitized)
+
+
 def build_request_url(base_url: str, params: Dict[str, Any]) -> str:
     return f"{base_url}?{urlencode(params, doseq=True)}"
+
+
+def build_public_url(base_url: str, params: Dict[str, Any]) -> str:
+    """OC 값을 마스킹한 공개용 URL.
+
+    수집 기록(`source_url`)은 provenance 식별에만 쓰이므로 개인 OC를 남길 이유가 없다.
+    실제 요청은 `LawApiClient._request`가 수행하며, 이 함수가 만드는 URL은 저장 전용이다.
+    """
+    public_params = {**params, "OC": PUBLIC_OC_PLACEHOLDER}
+    return f"{base_url}?{urlencode(public_params, doseq=True)}"
+
+
+_OC_PARAM_PATTERN = re.compile(r"([?&])OC=[^&]*")
+
+
+def mask_oc_in_url(url: str) -> str:
+    """URL 문자열에서 `OC=...` 파라미터 값을 `YOUR_OC`로 치환한다.
+
+    API 응답이 자체적으로 돌려주는 `detail_link` 같은 문자열에 개인 OC가 섞여 들어오는
+    경우를 막기 위해 저장 직전에 호출한다.
+    """
+    if not url:
+        return url
+    return _OC_PARAM_PATTERN.sub(lambda m: f"{m.group(1)}OC={PUBLIC_OC_PLACEHOLDER}", url)

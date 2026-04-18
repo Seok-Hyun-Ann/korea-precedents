@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
 
-from api_client import BASE_SEARCH_URL, BASE_SERVICE_URL, LawApiClient, build_request_url, parse_xml, save_text
+from api_client import BASE_SEARCH_URL, BASE_SERVICE_URL, LawApiClient, build_public_url, mask_oc_in_url, parse_xml, save_text_sanitized
 
 ROOT = Path(__file__).resolve().parent.parent
 RAW_DIR = ROOT / "data" / "raw" / "laws"
@@ -20,7 +20,7 @@ def text_of(node, tag: str) -> str:
 def fetch_law_list(client: LawApiClient, page: int = 1, display: int = 20) -> List[Dict[str, str]]:
     xml_text = client.search("law", page=page, display=display)
     timestamp = datetime.now(timezone.utc).isoformat()
-    save_text(RAW_DIR / f"law-list-page-{page}.xml", xml_text)
+    save_text_sanitized(RAW_DIR / f"law-list-page-{page}.xml", xml_text)
     root = parse_xml(xml_text)
     rows = []
     for law in root.findall('.//law'):
@@ -33,12 +33,12 @@ def fetch_law_list(client: LawApiClient, page: int = 1, display: int = 20) -> Li
             'effective_date': text_of(law, '시행일자'),
             'ministry': text_of(law, '소관부처명'),
             'law_type': text_of(law, '법령구분명'),
-            'detail_link': text_of(law, '법령상세링크'),
+            'detail_link': mask_oc_in_url(text_of(law, '법령상세링크')),
             'source_system': '국가법령정보센터',
             'api_target': 'law',
             'request_type': 'list',
             'collected_at': timestamp,
-            'source_url': build_request_url(BASE_SEARCH_URL, {'OC': client.oc, 'target': 'law', 'type': client.response_type, 'page': page, 'display': display}),
+            'source_url': build_public_url(BASE_SEARCH_URL, {'target': 'law', 'type': client.response_type, 'page': page, 'display': display}),
         })
     return rows
 
@@ -46,7 +46,7 @@ def fetch_law_list(client: LawApiClient, page: int = 1, display: int = 20) -> Li
 def fetch_law_detail(client: LawApiClient, law_id: str) -> Dict[str, object]:
     xml_text = client.service('eflaw', ID=law_id)
     timestamp = datetime.now(timezone.utc).isoformat()
-    save_text(RAW_DIR / f"law-{law_id}.xml", xml_text)
+    save_text_sanitized(RAW_DIR / f"law-{law_id}.xml", xml_text)
     root = parse_xml(xml_text)
     basic = root.find('기본정보')
     articles = []
@@ -69,7 +69,7 @@ def fetch_law_detail(client: LawApiClient, law_id: str) -> Dict[str, object]:
         'api_target': 'eflaw',
         'request_type': 'detail',
         'collected_at': timestamp,
-        'source_url': build_request_url(BASE_SERVICE_URL, {'OC': client.oc, 'target': 'eflaw', 'type': client.response_type, 'ID': law_id}),
+        'source_url': build_public_url(BASE_SERVICE_URL, {'target': 'eflaw', 'type': client.response_type, 'ID': law_id}),
         'articles': articles,
     }
 
