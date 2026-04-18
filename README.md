@@ -155,3 +155,52 @@ cp .env.example .env
 ## 기여
 
 버그 리포트, 기능 제안, PR 모두 환영합니다.
+
+## 전체 삭제 방법
+
+이 도구는 세 곳에 파일을 남깁니다. 아래 순서대로 지우면 완전히 제거됩니다.
+
+### 1. 리포 폴더 삭제 (DB 1.4GB 포함)
+
+`data/precedents.db`는 리포 폴더 안에 있으므로 폴더째 지우면 같이 삭제됩니다.
+
+**Linux / macOS**
+```bash
+rm -rf korea-precedents
+```
+
+**Windows (PowerShell)**
+```powershell
+Remove-Item -Recurse -Force korea-precedents
+```
+
+**Windows (cmd)**
+```cmd
+rmdir /s /q korea-precedents
+```
+
+### 2. HuggingFace 캐시 삭제
+
+`huggingface_hub`가 다운로드 과정에서 별도 캐시를 만들 수 있습니다. 다른 HF 도구를 쓰지 않는다면 캐시 전체를 지워도 안전합니다.
+
+**Linux / macOS**
+```bash
+rm -rf ~/.cache/huggingface
+```
+
+**Windows (PowerShell)**
+```powershell
+Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\huggingface"
+```
+
+이 프로젝트의 캐시만 골라 지우고 싶다면 `~/.cache/huggingface/hub/` 아래 `datasets--SH98--korea-precedents` 폴더만 삭제하세요.
+
+### 3. pip 패키지 제거 (선택)
+
+가상환경(`venv` 등)에 설치했다면 가상환경 폴더만 지우면 끝입니다. 시스템 전역에 설치했다면 다음 명령으로 제거할 수 있습니다.
+
+```bash
+python -m pip uninstall -y streamlit pandas huggingface_hub requests datasets
+```
+
+다른 프로젝트에서 같은 패키지를 쓰고 있다면 이 단계는 건너뛰세요.
