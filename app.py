@@ -153,10 +153,12 @@ def find_similar_cases(pid: str, limit: int = 8) -> list[dict]:
     """현재 판례와 유사한 판례를 BM25로 추천한다.
 
     전략: case_name + decision_points에서 핵심 단어 추출 → FTS5 OR 쿼리 →
-    같은 법령을 적용한 판례는 우선 가중.
+    같은 법령을 적용한 판례는 우선 가중. 각 추천 건에는 공통 법령·사건유형·
+    판결결과·인용 관계 등 '추천 근거'를 함께 담아 반환한다.
     """
     case = query_one(
-        "SELECT case_name, decision_points FROM cases WHERE precedent_id = ?",
+        "SELECT case_name, decision_points, case_number, case_type, result_class "
+        "FROM cases WHERE precedent_id = ?",
         (pid,),
     )
     if not case:
@@ -174,6 +176,14 @@ def find_similar_cases(pid: str, limit: int = 8) -> list[dict]:
             "SELECT DISTINCT law_name FROM case_laws WHERE precedent_id = ?", (pid,)
         )
     ]
+    src_laws_full = {
+        (r["law_name"], r["article_label"]) for r in query(
+            "SELECT law_name, article_label FROM case_laws WHERE precedent_id = ?", (pid,)
+        )
+    }
+    src_case_number = case.get("case_number", "") or ""
+    src_case_type = (case.get("case_type") or "").strip()
+    src_result_class = (case.get("result_class") or "").strip()
 
     # 1차: 같은 법령 교집합 + BM25
     primary: list[dict] = []
@@ -220,6 +230,60 @@ def find_similar_cases(pid: str, limit: int = 8) -> list[dict]:
                 seen_ids.add(r["precedent_id"])
                 if len(primary) >= limit:
                     break
+
+    # ── 추천 근거 계산 (공통 법령, 동일 사건유형/판결결과, 인용 관계) ──
+    if primary:
+        pids = [r["precedent_id"] for r in primary]
+        placeholders = ",".join(["?"] * len(pids))
+        cand_laws_map: dict[str, set[tuple[str, str]]] = {}
+        for r in query(
+            f"SELECT precedent_id, law_name, article_label FROM case_laws "
+            f"WHERE precedent_id IN ({placeholders})",
+            tuple(pids),
+        ):
+            cand_laws_map.setdefault(r["precedent_id"], set()).add(
+                (r["law_name"], r["article_label"])
+            )
+
+        cand_case_numbers = [r.get("case_number", "") for r in primary if r.get("case_number")]
+        cites_from_src: set[str] = set()
+        cited_by_src: set[str] = set()
+        if src_case_number and cand_case_numbers:
+            cn_placeholders = ",".join(["?"] * len(cand_case_numbers))
+            for r in query(
+                f"SELECT cited_case_number FROM citations "
+                f"WHERE citing_case_number = ? AND cited_case_number IN ({cn_placeholders})",
+                tuple([src_case_number] + cand_case_numbers),
+            ):
+                cites_from_src.add(r["cited_case_number"])
+            for r in query(
+                f"SELECT citing_case_number FROM citations "
+                f"WHERE cited_case_number = ? AND citing_case_number IN ({cn_placeholders})",
+                tuple([src_case_number] + cand_case_numbers),
+            ):
+                cited_by_src.add(r["citing_case_number"])
+
+        for r in primary:
+            cand_laws = cand_laws_map.get(r["precedent_id"], set())
+            common = src_laws_full & cand_laws
+            shared = sorted(
+                f"{ln} {al}".strip() for ln, al in common if ln
+            )
+            r["shared_laws"] = shared[:3]
+            r["shared_laws_count"] = len(common)
+            r["same_case_type"] = bool(
+                src_case_type and (r.get("case_type") or "").strip() == src_case_type
+            )
+            r["same_result_class"] = bool(
+                src_result_class and (r.get("result_class") or "").strip() == src_result_class
+            )
+            cand_cn = r.get("case_number", "")
+            if cand_cn and cand_cn in cites_from_src:
+                r["citation_relation"] = "cites"  # 원본이 이 판례를 인용
+            elif cand_cn and cand_cn in cited_by_src:
+                r["citation_relation"] = "cited_by"  # 이 판례가 원본을 인용
+            else:
+                r["citation_relation"] = None
 
     return primary
 
@@ -312,7 +376,10 @@ def show_case_detail(pid: str) -> None:
     # 유사 판례 추천
     st.markdown("---")
     st.markdown("**🔎 유사 판례 추천**")
-    st.caption("사건명과 판시사항의 핵심 단어를 기반으로 BM25 점수로 정렬합니다. 같은 법령을 적용한 판례를 우선합니다.")
+    st.caption(
+        "사건명·판시사항의 핵심 단어 BM25 점수로 정렬하고, "
+        "각 추천 건에 **추천 근거**(공통 법령·동일 사건유형/판결결과·인용 관계)를 함께 표시합니다."
+    )
     similar = find_similar_cases(pid, limit=8)
     if not similar:
         st.caption("유사 판례를 찾을 수 없습니다.")
@@ -334,19 +401,86 @@ def show_case_detail(pid: str) -> None:
                         st.session_state["detail_id"] = s["precedent_id"]
                         st.rerun()
 
+                # 추천 근거 배지
+                chips: list[str] = []
+                cr = s.get("citation_relation")
+                if cr == "cites":
+                    chips.append("🔗 이 판례를 인용함")
+                elif cr == "cited_by":
+                    chips.append("🔗 이 판례가 원본을 인용")
+                if s.get("shared_laws_count", 0) > 0:
+                    preview = ", ".join(s.get("shared_laws") or [])
+                    more = s["shared_laws_count"] - len(s.get("shared_laws") or [])
+                    label = f"⚖️ 공통 법령 {s['shared_laws_count']}개"
+                    if preview:
+                        label += f" ({preview}"
+                        if more > 0:
+                            label += f" 외 {more}"
+                        label += ")"
+                    chips.append(label)
+                if s.get("same_case_type"):
+                    chips.append(f"📁 같은 사건유형: {s.get('case_type', '')}")
+                if s.get("same_result_class"):
+                    chips.append(f"🎯 같은 판결결과: {s.get('result_class', '')}")
+                if chips:
+                    st.caption(" · ".join(chips))
+                else:
+                    st.caption("📝 본문 키워드 유사도 기반 (공통 법령·인용 관계 없음)")
+
     # 전문
     if case.get("full_text"):
         with st.expander("전문 보기"):
             st.text(case["full_text"])
 
 
+# ── FTS5 snippet: 매칭 위치 주변 본문에서 키워드에 <mark> 태그를 두른다 ──
+# cases_fts 컬럼 순서(build_db.py): 0=case_number, 1=case_name, 2=court_name,
+# 3=decision_points, 4=decision_summary, 5=key_reasoning, 6=easy_explanation
+SNIPPET_COLUMNS: list[tuple[int, str]] = [
+    (3, "판시사항"),
+    (4, "판결요지"),
+    (5, "핵심 판단"),
+    (6, "쉬운 설명"),
+    (1, "사건명"),
+]
+SNIPPET_SELECT = ",\n".join(
+    f"snippet(cases_fts, {idx}, '<mark>', '</mark>', '…', 20) AS snip_{idx}"
+    for idx, _ in SNIPPET_COLUMNS
+)
+
+
+def best_snippet(case: dict) -> tuple[str, str] | None:
+    """FTS 결과 row에서 가장 먼저 매칭이 발견된 snippet과 그 컬럼 라벨을 반환한다."""
+    for idx, label in SNIPPET_COLUMNS:
+        snip = case.get(f"snip_{idx}")
+        if snip and "<mark>" in snip:
+            return label, snip
+    return None
+
+
+def highlight_like(text: str, query_str: str) -> str:
+    """LIKE 모드에서 매칭 토큰을 <mark>로 감싼다. 단순 부분일치."""
+    if not text or not query_str:
+        return text or ""
+    pattern = re.compile(re.escape(query_str), re.IGNORECASE)
+    return pattern.sub(lambda m: f"<mark>{m.group(0)}</mark>", text)
+
+
 # ── 공통: 판례 카드 (목록에서 사용) ──
-def show_case_card(case: dict, key_prefix: str) -> None:
-    """판례 1건을 카드 형태로 표시한다. 상세 보기 버튼 포함."""
+def show_case_card(case: dict, key_prefix: str, query_str: str = "") -> None:
+    """판례 1건을 카드 형태로 표시한다. 상세 보기 버튼 포함.
+
+    case에 `snip_*` 필드가 있으면 FTS snippet을 하이라이트해 보여주고,
+    없으면 `query_str`로 사건명/쉬운 설명에 하이라이트를 적용한다.
+    """
     with st.container(border=True):
         cols = st.columns([4, 1])
         with cols[0]:
-            st.markdown(f"**{case['case_number']}** — {case['case_name']}")
+            case_name_disp = highlight_like(case.get("case_name", ""), query_str) if query_str else case.get("case_name", "")
+            st.markdown(
+                f"**{case['case_number']}** — {case_name_disp}",
+                unsafe_allow_html=bool(query_str),
+            )
             st.caption(
                 f"{case.get('court_name', '')} · "
                 f"{fmt_date(case.get('decision_date', ''))} · "
@@ -359,8 +493,19 @@ def show_case_card(case: dict, key_prefix: str) -> None:
                     "무죄": "🟢", "항소기각": "🔴"}.get(rc, "⚪")
             st.markdown(f"{icon} **{rc}**")
 
-        if case.get("easy_explanation"):
-            st.markdown(f"_{case['easy_explanation']}_")
+        snip = best_snippet(case)
+        if snip:
+            label, html = snip
+            st.markdown(
+                f"<span style='color:#888;font-size:0.85em'>[{label}]</span> {html}",
+                unsafe_allow_html=True,
+            )
+        elif case.get("easy_explanation"):
+            exp = highlight_like(case["easy_explanation"], query_str) if query_str else case["easy_explanation"]
+            if query_str:
+                st.markdown(f"<em>{exp}</em>", unsafe_allow_html=True)
+            else:
+                st.markdown(f"_{exp}_")
 
         btn_cols = st.columns([1, 1, 4])
         with btn_cols[0]:
@@ -432,31 +577,77 @@ elif page == "🔍 판례 검색":
         search_mode = st.selectbox("검색 방식", ["전문 검색", "사건번호", "사건명"])
 
     with st.expander("상세 필터", expanded=False):
-        fcol1, fcol2, fcol3, fcol4 = st.columns(4)
+        fcol1, fcol2 = st.columns(2)
         with fcol1:
             case_types = query("SELECT DISTINCT case_type FROM cases WHERE case_type != '' ORDER BY case_type")
             type_options = ["전체"] + [r["case_type"] for r in case_types]
             selected_type = st.selectbox("사건유형", type_options)
-        with fcol2:
             result_classes = query("SELECT DISTINCT result_class FROM cases ORDER BY result_class")
             result_options = ["전체"] + [r["result_class"] for r in result_classes]
             selected_result = st.selectbox("판결결과", result_options)
-        with fcol3:
-            year_from = st.number_input("시작 연도", min_value=1940, max_value=2025, value=1940)
-        with fcol4:
-            year_to = st.number_input("종료 연도", min_value=1940, max_value=2025, value=2025)
+        with fcol2:
+            article_filter = st.text_input(
+                "조문 단위 필터",
+                placeholder="예: 민법 제750조 (법령명만 적어도 됨)",
+                help="해당 법령/조문이 적용된 판례만. 공백으로 법령명과 조문 구분.",
+            )
+            min_citations = st.number_input(
+                "최소 인용 횟수",
+                min_value=0, max_value=1000, value=0, step=1,
+                help="이 판례를 인용한 다른 판례의 수. 0이면 필터 없음.",
+            )
+
+        year_preset = st.radio(
+            "기간",
+            ["전체", "최근 5년", "최근 10년", "2020년대", "2010년대", "2000년대", "직접 입력"],
+            horizontal=True, index=0,
+        )
+
+        current_year = 2026
+        preset_map = {
+            "전체": (1940, 2025),
+            "최근 5년": (current_year - 5, current_year),
+            "최근 10년": (current_year - 10, current_year),
+            "2020년대": (2020, 2029),
+            "2010년대": (2010, 2019),
+            "2000년대": (2000, 2009),
+        }
+        if year_preset == "직접 입력":
+            yc1, yc2 = st.columns(2)
+            with yc1:
+                year_from = st.number_input("시작 연도", min_value=1940, max_value=2025, value=1940)
+            with yc2:
+                year_to = st.number_input("종료 연도", min_value=1940, max_value=2025, value=2025)
+        else:
+            year_from, year_to = preset_map[year_preset]
+
+
+    def _parse_article_filter(raw: str) -> tuple[str, str] | None:
+        """'민법 제750조' → ('민법', '제750조'). 법령명만 주어지면 ('민법', '')."""
+        raw = (raw or "").strip()
+        if not raw:
+            return None
+        m = re.search(r"(제?\s*\d+\s*조(?:\s*의\s*\d+)?)", raw)
+        if m:
+            article = re.sub(r"\s+", "", m.group(1))
+            if not article.startswith("제"):
+                article = "제" + article
+            law_name = raw[: m.start()].strip()
+            return (law_name, article) if law_name else ("", article)
+        return (raw, "")
 
     if search_query:
         params: list = []
 
         if search_mode == "전문 검색":
             fts_query = search_query.replace('"', '""')
-            base_sql = """
+            base_sql = f"""
                 SELECT c.precedent_id, c.case_number, c.case_name, c.court_name,
                        c.decision_date, c.case_type, c.result_class, c.ruling_for,
-                       c.easy_explanation
-                FROM cases_fts fts
-                JOIN cases c ON c.rowid = fts.rowid
+                       c.easy_explanation,
+                       {SNIPPET_SELECT}
+                FROM cases_fts
+                JOIN cases c ON c.rowid = cases_fts.rowid
                 WHERE cases_fts MATCH ?
             """
             params.append(f'"{fts_query}"')
@@ -493,6 +684,34 @@ elif page == "🔍 판례 검색":
         filters.append(f"{prefix}decision_date <= ?")
         params.append(f"{year_to}1231")
 
+        parsed_article = _parse_article_filter(article_filter)
+        if parsed_article:
+            law_name, article = parsed_article
+            if law_name and article:
+                filters.append(
+                    f"EXISTS (SELECT 1 FROM case_laws cl WHERE cl.precedent_id = {prefix}precedent_id "
+                    "AND cl.law_name = ? AND cl.article_label = ?)"
+                )
+                params.extend([law_name, article])
+            elif law_name:
+                filters.append(
+                    f"EXISTS (SELECT 1 FROM case_laws cl WHERE cl.precedent_id = {prefix}precedent_id "
+                    "AND cl.law_name = ?)"
+                )
+                params.append(law_name)
+            elif article:
+                filters.append(
+                    f"EXISTS (SELECT 1 FROM case_laws cl WHERE cl.precedent_id = {prefix}precedent_id "
+                    "AND cl.article_label = ?)"
+                )
+                params.append(article)
+
+        if min_citations and min_citations > 0:
+            filters.append(
+                f"(SELECT COUNT(*) FROM citations WHERE cited_case_number = {prefix}case_number) >= ?"
+            )
+            params.append(int(min_citations))
+
         if filters:
             base_sql += " AND " + " AND ".join(filters)
         base_sql += f" ORDER BY {prefix}decision_date DESC LIMIT 100"
@@ -501,7 +720,7 @@ elif page == "🔍 판례 검색":
         st.subheader(f"검색 결과: {len(results)}건" + (" (최대 100건)" if len(results) == 100 else ""))
 
         for r in results:
-            show_case_card(r, "search")
+            show_case_card(r, "search", query_str=search_query)
 
 
 # ════════════════════════════════════════
