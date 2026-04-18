@@ -16,8 +16,8 @@ AI 없이 정규식과 패턴 매칭만으로 판례를 구조화하고, SQLite 
 ## 빠른 시작 (3줄로 끝)
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/korea-precedent-search.git
-cd korea-precedent-search
+git clone https://github.com/Seok-Hyun-Ann/korea-precedents.git
+cd korea-precedents
 pip install -r requirements.txt
 streamlit run app.py
 ```
