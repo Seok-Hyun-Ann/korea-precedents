@@ -1178,6 +1178,6 @@ elif page == "📊 통계":
 st.sidebar.divider()
 st.sidebar.caption(
     "데이터 출처: 법제처 국가법령정보센터 (공공저작물)  \n"
-    "법령 데이터: legalize-kr (MIT)  \n"
+    "법령 데이터 파싱 참조: legalize-kr/legalize-kr  \n"
     "판례 원문은 저작권법 제7조에 의해 자유이용 가능"
 )

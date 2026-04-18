@@ -142,7 +142,7 @@ cp .env.example .env
 
 ### 법령 데이터
 - **출처**: 국가법령정보센터 Open API (법제처 국가법령정보 공동활용)
-- 법령 파싱 참조: [lbox-open/legalize-kr](https://github.com/lbox-open/legalize-kr) (MIT License)
+- 법령 파싱 참조: [legalize-kr/legalize-kr](https://github.com/legalize-kr/legalize-kr) — 대한민국 법령을 Markdown + Git 커밋으로 아카이브한 저장소 (라이선스 별도 명시 없음, 이용 시 각자 확인)
 
 자세한 내용은 [docs/attribution.md](docs/attribution.md)를 참고하세요.
 
