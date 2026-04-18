@@ -27,6 +27,16 @@ streamlit run app.py
 
 브라우저에서 `http://localhost:8501` 로 접속하면 끝입니다.
 
+### `streamlit: command not found` / `'streamlit'은(는) 인식할 수 없는 명령입니다`가 뜨면
+
+`pip install -r requirements.txt`는 Streamlit을 설치하지만, 환경에 따라 실행 파일이 PATH에 추가되지 않아 `streamlit` 명령을 직접 찾지 못하는 경우가 있습니다. 다음처럼 실행하면 PATH와 무관하게 동작합니다.
+
+```bash
+python -m streamlit run app.py
+```
+
+같은 이유로 설치도 `python -m pip install -r requirements.txt`로 하는 편이 여러 파이썬 버전이 섞인 환경에서 더 안전합니다. 그래도 안 되면 Python 3.10 이상이 설치되어 있는지(`python --version`), `pip`가 원하는 파이썬과 연결돼 있는지(`python -m pip --version`) 확인하세요.
+
 ## 시스템 요구사항
 
 - Python 3.10 이상
