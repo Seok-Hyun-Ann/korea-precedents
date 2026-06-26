@@ -8,8 +8,9 @@ AI 없이 정규식과 패턴 매칭만으로 판례를 구조화하고, SQLite 
 
 - **판례 검색** — 전문검색(FTS5) + 매칭 위치 하이라이트(`<mark>` 스니펫), 사건번호·사건명 모드
 - **고급 필터** — 사건유형/판결결과, **조문 단위 필터**(예: `민법 제750조`), **최소 인용 횟수**, **기간 프리셋**(최근 5년·2020년대 등)
-- **법령별 조회** — 1,180개 법령별 판례 목록, 복수 법령 AND 필터
+- **법령별 조회** — 1,183개 법령별 판례 목록, 복수 법령 AND 필터
 - **판례 비교** — 두 판례를 나란히 놓고 판결결과·적용법령·본문을 병렬 비교
+- **선고 당시 vs 현행 조문** — 적용 법령이 판결 선고 이후 개정됐는지 표시하고, 개정된 조문은 **선고 당시 시행되던 원문**과 현행 조문을 나란히 비교
 - **근거 기반 유사 판례 추천** — BM25 + 공통 법령·동일 사건유형/판결결과·인용 관계를 배지로 표시 (왜 추천됐는지가 눈에 보임)
 - **인용 관계** — 139,028건 인용 엣지, 최다 인용 판례 탐색
 - **통계** — 연도별/법원별/유형별/결과별 분포, 법령 TOP 30
@@ -77,7 +78,17 @@ streamlit run app.py
 
 **앱 실행만 하실 거면 이 섹션은 건너뛰세요.** 이 섹션은 새 판례를 추가하거나 파이프라인을 수정하고 싶은 개발자용입니다.
 
-### 1. 국가법령정보센터 API 키 신청
+### 1. 파이프라인 의존성 설치
+
+파이프라인은 앱보다 의존성이 많습니다(수집·파싱·선택적 AI 해설).
+
+```bash
+pip install -r requirements-pipeline.txt
+```
+
+> `anthropic`은 `scripts/generate_explanations.py`(선택: 쉬운 설명 생성)에서만 사용합니다.
+
+### 2. 국가법령정보센터 API 키 신청
 
 [open.law.go.kr](https://open.law.go.kr/LSO/openApi/guideList.do)에서 신청 후:
 ```bash
@@ -85,7 +96,7 @@ cp .env.example .env
 # .env 파일의 LAW_GO_KR_OC= 뒤에 받은 ID 입력
 ```
 
-### 2. 파이프라인 실행
+### 3. 파이프라인 실행
 
 ```
 1. 판례 수집       scripts/download_hf_precedents.py (HF) + fetch_cases_all.py (신규)
@@ -98,6 +109,21 @@ cp .env.example .env
 8. 검색 인덱스     scripts/build_search_index.py
 9. SQLite DB 생성  scripts/build_db.py
 ```
+
+선고 당시/현행 조문 비교 기능은 법령 버전 데이터가 필요하다 (OC 키 필요).
+
+```
+10. 법령 버전 수집     scripts/fetch_law_versions.py  (선고 당시 조문 원문)
+```
+
+`build_db.py`(9단계)가 이미 법령별 현행 시행일자를 담은 `laws` 테이블을 만든다.
+DB를 다시 빌드하지 않고 기존 DB에만 보강하려면 `scripts/add_law_meta.py`를 쓰면 된다.
+
+`fetch_law_versions.py`는 판례가 참조하는 법령의 시행버전을 받아오므로 시간이 걸린다.
+`--law 민법`처럼 특정 법령만, `--top 100`처럼 참조가 많은 상위 법령만, `--limit 20`처럼 일부만
+받을 수 있고, 중단 후 재실행하면 이어서 받는다.
+
+수집한 DB를 HuggingFace 배포 리포에 올리려면 `scripts/upload_db_to_hf.py`를 실행한다.
 
 ## 기술 스택
 
@@ -123,6 +149,7 @@ cp .env.example .env
 │   ├── extract_citations.py
 │   ├── structurize_cases.py
 │   ├── build_db.py
+│   ├── fetch_law_versions.py  # 선고 당시 조문 수집
 │   └── ...
 ├── docs/                     # 문서
 └── data/                     # 자동 생성 (gitignore)
