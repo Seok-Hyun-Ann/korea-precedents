@@ -16,7 +16,13 @@ ROOT = Path(__file__).resolve().parent.parent
 STRUCTURED_PATH = ROOT / "data" / "structured" / "all_structured.json"
 CITATIONS_PATH = ROOT / "data" / "citations" / "citation_edges.json"
 PRECEDENTS_PATH = ROOT / "data" / "precedents_merged" / "all_precedents.json"
+LAWS_PARSED_PATH = ROOT / "data" / "laws_parsed" / "all_laws.json"
 DB_PATH = ROOT / "data" / "precedents.db"
+
+
+def _to_yyyymmdd(s: str) -> str:
+    s = (s or "").replace("-", "").replace(".", "").strip()
+    return s if len(s) == 8 and s.isdigit() else ""
 
 
 def create_tables(conn: sqlite3.Connection) -> None:
@@ -56,6 +62,16 @@ def create_tables(conn: sqlite3.Connection) -> None:
             FOREIGN KEY (precedent_id) REFERENCES cases(precedent_id)
         );
 
+        -- 법령 메타 (현행 시행일자 등) — 선고 당시/현행 조문 비교용
+        CREATE TABLE IF NOT EXISTS laws (
+            law_name          TEXT PRIMARY KEY,
+            law_id            TEXT,
+            law_mst           TEXT,
+            law_type          TEXT,
+            promulgation_date TEXT,
+            effective_date    TEXT
+        );
+
         -- 인용 관계 (판례 → 판례)
         CREATE TABLE IF NOT EXISTS citations (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,10 +89,20 @@ def create_tables(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_cases_case_type ON cases(case_type);
         CREATE INDEX IF NOT EXISTS idx_cases_result_class ON cases(result_class);
         CREATE INDEX IF NOT EXISTS idx_cases_court_name ON cases(court_name);
+        CREATE INDEX IF NOT EXISTS idx_cases_date_type_result
+            ON cases(decision_date, case_type, result_class);
         CREATE INDEX IF NOT EXISTS idx_case_laws_precedent_id ON case_laws(precedent_id);
         CREATE INDEX IF NOT EXISTS idx_case_laws_law_name ON case_laws(law_name);
+        -- 같은 (판례, 법령명, 조문)이 중복 적재되지 않도록 한다.
+        -- INSERT OR IGNORE와 함께 동작해 앱의 SELECT DISTINCT 의존을 줄인다.
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_case_laws
+            ON case_laws(precedent_id, law_name, article_label);
         CREATE INDEX IF NOT EXISTS idx_citations_citing ON citations(citing);
         CREATE INDEX IF NOT EXISTS idx_citations_cited ON citations(cited);
+        CREATE INDEX IF NOT EXISTS idx_citations_citing_case_number
+            ON citations(citing_case_number);
+        CREATE INDEX IF NOT EXISTS idx_citations_cited_case_number
+            ON citations(cited_case_number);
     """)
 
 
@@ -210,7 +236,7 @@ def main() -> None:
     print(f"  cases: {len(case_rows):,}건 삽입")
 
     conn.executemany(
-        "INSERT INTO case_laws (precedent_id, law_name, article_label, article_title, article_text) "
+        "INSERT OR IGNORE INTO case_laws (precedent_id, law_name, article_label, article_title, article_text) "
         "VALUES (?,?,?,?,?)",
         law_rows,
     )
@@ -241,6 +267,36 @@ def main() -> None:
         print(f"  citations: {len(cite_rows):,}건 삽입")
         del citations, cite_rows
 
+    # 3-2) 법령 메타 (법령명별 현행 시행일 최신본)
+    if LAWS_PARSED_PATH.exists():
+        print("\n법령 메타 로드 중...")
+        all_laws = json.loads(LAWS_PARSED_PATH.read_text(encoding="utf-8"))
+        best: dict[str, tuple] = {}
+        best_eff: dict[str, str] = {}
+        for x in all_laws:
+            name = x.get("law_name", "")
+            if not name:
+                continue
+            eff = _to_yyyymmdd(x.get("effective_date", ""))
+            if name not in best or eff > best_eff[name]:
+                best_eff[name] = eff
+                best[name] = (
+                    name,
+                    x.get("law_id", ""),
+                    x.get("law_mst", ""),
+                    x.get("law_type", ""),
+                    _to_yyyymmdd(x.get("promulgation_date", "")),
+                    eff,
+                )
+        conn.executemany(
+            "INSERT OR REPLACE INTO laws "
+            "(law_name, law_id, law_mst, law_type, promulgation_date, effective_date) "
+            "VALUES (?,?,?,?,?,?)",
+            list(best.values()),
+        )
+        print(f"  laws: {len(best):,}개 법령 삽입")
+        del all_laws, best, best_eff
+
     conn.commit()
 
     # 4) FTS 인덱스 생성
@@ -261,7 +317,7 @@ def main() -> None:
 
     # 간단한 검증
     conn = sqlite3.connect(str(DB_PATH))
-    for table in ("cases", "case_laws", "citations"):
+    for table in ("cases", "case_laws", "citations", "laws"):
         count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         print(f"  {table}: {count:,}건")
     conn.close()

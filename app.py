@@ -11,12 +11,18 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+from datetime import date
 from pathlib import Path
+from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "precedents.db"
+
+# 판례 데이터의 연도 범위. 상한은 실행 시점 기준으로 자동 계산한다.
+MIN_YEAR = 1940
+CURRENT_YEAR = date.today().year
 
 # HuggingFace에 업로드된 DB 위치.
 # 환경변수로 오버라이드 가능 (예: 포크한 사용자가 자기 리포를 쓰고 싶을 때)
@@ -103,6 +109,22 @@ def get_db():
     conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA cache_size=-32000")
+
+    # 앱이 실제로 질의하는 컬럼(case_number 계열)에 대한 인덱스 보강.
+    # 빌드 시점 DB에 없을 수 있어 IF NOT EXISTS로 1회만 생성한다.
+    # (읽기 전용 파일시스템에 배포된 경우 생성이 실패해도 동작에는 지장 없음)
+    try:
+        conn.executescript("""
+            CREATE INDEX IF NOT EXISTS idx_citations_citing_case_number
+                ON citations(citing_case_number);
+            CREATE INDEX IF NOT EXISTS idx_citations_cited_case_number
+                ON citations(cited_case_number);
+            CREATE INDEX IF NOT EXISTS idx_cases_date_type_result
+                ON cases(decision_date, case_type, result_class);
+        """)
+    except sqlite3.OperationalError:
+        pass
+
     return conn
 
 
@@ -116,6 +138,16 @@ def query_one(sql: str, params: tuple = ()) -> dict | None:
     conn = get_db()
     row = conn.execute(sql, params).fetchone()
     return dict(row) if row else None
+
+
+@st.cache_data
+def corpus_stats() -> dict:
+    """전체 판례·법령·인용 건수. 정적 문자열 대신 DB에서 직접 집계한다."""
+    return {
+        "cases": query_one("SELECT COUNT(*) AS n FROM cases")["n"],
+        "laws": query_one("SELECT COUNT(DISTINCT law_name) AS n FROM case_laws")["n"],
+        "citations": query_one("SELECT COUNT(*) AS n FROM citations")["n"],
+    }
 
 
 def fmt_date(dd: str) -> str:
@@ -289,6 +321,104 @@ def find_similar_cases(pid: str, limit: int = 8) -> list[dict]:
 
 
 # ── 공통: 판례 상세 보기 ──
+# ── 적용 법령의 선고 당시 / 현행 조문 정합성 ──
+# 조문 본문에 표기된 개정 이력(<개정 ...>, <신설 ...>)을 선고일과 대조해
+# "현행 조문이 판결 당시와 같은지"를 판별한다. 별도 수집 데이터 없이 동작한다.
+_LAW_DATE_RE = re.compile(r"(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})")
+
+
+def parse_amendment_dates(article_text: str) -> list[str]:
+    """조문 본문의 <...> 마커에서 개정·신설일을 YYYYMMDD로 추출한다."""
+    dates: set[str] = set()
+    for marker in re.findall(r"<[^>]*>", article_text or ""):
+        for y, m, d in _LAW_DATE_RE.findall(marker):
+            dates.add(f"{int(y):04d}{int(m):02d}{int(d):02d}")
+    return sorted(dates)
+
+
+def amendment_status(article_text: str, decision_date: str) -> dict:
+    """선고일(YYYYMMDD) 대비 조문 개정 상태를 판정한다.
+
+    조문 본문에 표기된 개정 이력(<개정 ...>, <신설 ...>, <전문개정 ...>)이 유일한
+    조문 단위 근거다. (법령 단위 시행일자는 '법령 전체'가 바뀌었는지만 알려주므로
+    특정 조문 판정에는 쓰지 않는다 — 상세 화면에서 별도 안내로만 노출한다.)
+
+    verdict:
+      changed     조문 마커가 선고 이후 → 현행 조문이 당시와 다름
+      same        조문 마커가 모두 선고 이전 → 당시 = 현행
+      no_history  마커 없음 → 제정 이후 미개정으로 추정 (당시 = 현행)
+      no_text     조문 본문이 수록되지 않음 → 판단 보류
+      unknown     선고일 정보가 없어 비교 불가
+    """
+    if not (article_text or "").strip():
+        return {"verdict": "no_text", "after": [], "all": []}
+    dates = parse_amendment_dates(article_text)
+    dd = (decision_date or "").strip()
+    if not (len(dd) == 8 and dd.isdigit()):
+        return {"verdict": "unknown", "after": [], "all": dates}
+    after = [d for d in dates if d > dd]
+    if after:
+        return {"verdict": "changed", "after": after, "all": dates}
+    return {"verdict": "same" if dates else "no_history", "after": [], "all": dates}
+
+
+def law_go_kr_url(law_name: str) -> str:
+    """국가법령정보센터의 해당 법령 페이지(연혁 확인 가능) URL."""
+    return "https://www.law.go.kr/법령/" + quote(law_name)
+
+
+@st.cache_data
+def law_effective_dates() -> dict:
+    """법령명 → 현행 시행일자(YYYYMMDD). laws 테이블이 있을 때만 채워진다.
+
+    (배포 DB에 laws 테이블이 없으면 빈 dict를 반환하고, 조문 마커만으로 판정한다.)
+    """
+    exists = query_one(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='laws'"
+    )
+    if not exists:
+        return {}
+    return {
+        r["law_name"]: r["effective_date"]
+        for r in query("SELECT law_name, effective_date FROM laws")
+    }
+
+
+@st.cache_data
+def phase2_available() -> bool:
+    """선고 당시 조문 원문(law_articles)이 수집돼 있는지 여부."""
+    return query_one(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='law_articles'"
+    ) is not None
+
+
+def historical_article(law_name: str, article_label: str, decision_date: str) -> dict | None:
+    """선고일에 시행 중이던 버전의 조문 원문을 반환한다 (수집돼 있을 때만)."""
+    if not phase2_available():
+        return None
+    dd = (decision_date or "").strip()
+    if not (len(dd) == 8 and dd.isdigit()):
+        return None
+    row = query_one("SELECT law_id FROM laws WHERE law_name = ?", (law_name,))
+    if not row or not row["law_id"]:
+        return None
+    version = query_one(
+        "SELECT effective_date, mst FROM law_versions "
+        "WHERE law_id = ? AND effective_date <= ? ORDER BY effective_date DESC LIMIT 1",
+        (row["law_id"], dd),
+    )
+    if not version:
+        return None
+    art = query_one(
+        "SELECT article_text, effective_date FROM law_articles "
+        "WHERE law_id = ? AND mst = ? AND article_label = ?",
+        (row["law_id"], version["mst"], article_label),
+    )
+    if not art or not (art["article_text"] or "").strip():
+        return None
+    return {"effective_date": art["effective_date"], "text": art["article_text"].strip()}
+
+
 def show_case_detail(pid: str) -> None:
     """precedent_id로 판례 상세 정보를 표시한다."""
     case = query_one("SELECT * FROM cases WHERE precedent_id = ?", (pid,))
@@ -322,15 +452,90 @@ def show_case_detail(pid: str) -> None:
     if case.get("easy_explanation"):
         st.info(case["easy_explanation"])
 
-    # 관련 법령
+    # 관련 법령 — 선고 당시 / 현행 조문 정합성
     laws = query(
-        "SELECT DISTINCT law_name, article_label FROM case_laws WHERE precedent_id = ?",
+        "SELECT law_name, article_label, MAX(article_text) AS article_text "
+        "FROM case_laws WHERE precedent_id = ? "
+        "GROUP BY law_name, article_label ORDER BY law_name, article_label",
         (pid,),
     )
     if laws:
         st.markdown("**관련 법령**")
-        law_tags = [f"`{l['law_name']} {l['article_label']}`" for l in laws]
+        law_tags = [f"`{(l['law_name'] + ' ' + (l['article_label'] or '')).strip()}`" for l in laws]
         st.markdown(" ".join(law_tags))
+
+        dd = case.get("decision_date", "")
+        eff_map = law_effective_dates()
+        statuses = [(l, amendment_status(l.get("article_text", ""), dd)) for l in laws]
+        changed_n = sum(1 for _, s in statuses if s["verdict"] == "changed")
+        same_n = sum(1 for _, s in statuses if s["verdict"] in ("same", "no_history"))
+
+        # 조문 마커는 없지만 소속 법령 전체는 선고 이후 개정된 경우 — 표기되지 않은
+        # 변경이 있을 수 있어 별도로 한 번만 안내한다. (조문 단위 단정은 하지 않음)
+        law_moved = sorted({
+            l["law_name"] for l, s in statuses
+            if s["verdict"] == "no_history"
+            and (eff_map.get(l["law_name"], "") > dd if dd and len(dd) == 8 else False)
+        })
+
+        if changed_n:
+            st.warning(
+                f"⚠️ 적용 법령 중 {changed_n}개 조문이 이 판결 선고({fmt_date(dd)}) "
+                "이후 개정되었습니다. 현행 조문은 판결 당시와 다를 수 있습니다."
+            )
+        elif same_n:
+            st.success("✅ 적용 법령 조문은 선고 당시와 동일합니다 (표기된 개정 이력 기준).")
+
+        if law_moved:
+            st.caption(
+                f"참고: {', '.join(law_moved)}은(는) 선고 이후 법령 개정 이력이 있어, "
+                "조문에 표기되지 않은 변경이 있을 수 있습니다. 연혁에서 확인하세요."
+            )
+
+        has_originals = phase2_available()
+        with st.expander("📜 적용 법령 — 선고 당시 vs 현행 조문", expanded=bool(changed_n)):
+            st.caption(
+                "조문 본문에 표기된 개정 이력을 선고일과 대조한 결과입니다."
+                + (" 개정된 조문은 선고 당시 원문을 현행과 나란히 보여줍니다."
+                   if has_originals else
+                   " 정확한 당시 원문은 국가법령정보센터 연혁에서 확인하세요.")
+            )
+            for l, status in statuses:
+                label = (l["law_name"] + " " + (l["article_label"] or "")).strip()
+                verdict = status["verdict"]
+                if verdict == "changed":
+                    badge = "🟠 선고 이후 조문 개정됨"
+                elif verdict in ("same", "no_history"):
+                    badge = "🟢 선고 당시와 동일"
+                elif verdict == "no_text":
+                    badge = "⚪ 조문 본문 미수록"
+                else:
+                    badge = "⚪ 선고일 정보 없음"
+                st.markdown(f"**{label}** · {badge}")
+                if status["after"]:
+                    amended = ", ".join(fmt_date(d) for d in status["after"])
+                    st.caption(f"선고 후 개정일: {amended}")
+
+                # 개정된 조문은 당시 원문과 현행을 좌우로 비교 (수집돼 있을 때만)
+                if verdict == "changed":
+                    hist = historical_article(l["law_name"], l["article_label"], dd)
+                    current_text = (l.get("article_text") or "").strip()
+                    if hist and current_text:
+                        hc1, hc2 = st.columns(2)
+                        with hc1:
+                            st.caption(f"선고 당시 (시행 {fmt_date(hist['effective_date'])})")
+                            st.markdown("> " + hist["text"].replace("\n", "  \n> "))
+                        with hc2:
+                            st.caption("현행")
+                            st.markdown("> " + current_text.replace("\n", "  \n> "))
+                    elif hist:
+                        st.caption(f"선고 당시 (시행 {fmt_date(hist['effective_date'])})")
+                        st.markdown("> " + hist["text"].replace("\n", "  \n> "))
+                text = (l.get("article_text") or "").strip()
+                if text:
+                    st.markdown(f"> {text}")
+                st.markdown(f"[국가법령정보센터에서 연혁 보기]({law_go_kr_url(l['law_name'])})")
+                st.divider()
 
     # 판시사항
     if case.get("decision_points"):
@@ -530,7 +735,13 @@ def show_case_card(case: dict, key_prefix: str, query_str: str = "") -> None:
 
 # ── 사이드바 ──
 st.sidebar.title("⚖️ 한국 판례 검색기")
-st.sidebar.caption("85,960건 대법원 판례 · 1,180개 법령 · 141,443건 인용관계")
+_stats = corpus_stats()
+st.sidebar.caption(
+    f"{_stats['cases']:,}건 대법원 판례 · "
+    f"{_stats['laws']:,}개 법령 · "
+    f"{_stats['citations']:,}건 인용관계"
+)
+st.sidebar.caption("연구·참고용입니다. 공식 법률 자문을 대체하지 않습니다.")
 
 page = st.sidebar.radio(
     "메뉴",
@@ -603,11 +814,10 @@ elif page == "🔍 판례 검색":
             horizontal=True, index=0,
         )
 
-        current_year = 2026
         preset_map = {
-            "전체": (1940, 2025),
-            "최근 5년": (current_year - 5, current_year),
-            "최근 10년": (current_year - 10, current_year),
+            "전체": (MIN_YEAR, CURRENT_YEAR),
+            "최근 5년": (CURRENT_YEAR - 5, CURRENT_YEAR),
+            "최근 10년": (CURRENT_YEAR - 10, CURRENT_YEAR),
             "2020년대": (2020, 2029),
             "2010년대": (2010, 2019),
             "2000년대": (2000, 2009),
@@ -615,9 +825,9 @@ elif page == "🔍 판례 검색":
         if year_preset == "직접 입력":
             yc1, yc2 = st.columns(2)
             with yc1:
-                year_from = st.number_input("시작 연도", min_value=1940, max_value=2025, value=1940)
+                year_from = st.number_input("시작 연도", min_value=MIN_YEAR, max_value=CURRENT_YEAR, value=MIN_YEAR)
             with yc2:
-                year_to = st.number_input("종료 연도", min_value=1940, max_value=2025, value=2025)
+                year_to = st.number_input("종료 연도", min_value=MIN_YEAR, max_value=CURRENT_YEAR, value=CURRENT_YEAR)
         else:
             year_from, year_to = preset_map[year_preset]
 
@@ -757,9 +967,9 @@ elif page == "📚 법령별 조회":
             type_options = ["전체"] + [r["case_type"] for r in case_types]
             selected_type = st.selectbox("사건유형", type_options, key="law_type")
         with fcol3:
-            year_from = st.number_input("시작 연도", min_value=1940, max_value=2025, value=1940, key="law_yf")
+            year_from = st.number_input("시작 연도", min_value=MIN_YEAR, max_value=CURRENT_YEAR, value=MIN_YEAR, key="law_yf")
         with fcol4:
-            year_to = st.number_input("종료 연도", min_value=1940, max_value=2025, value=2025, key="law_yt")
+            year_to = st.number_input("종료 연도", min_value=MIN_YEAR, max_value=CURRENT_YEAR, value=CURRENT_YEAR, key="law_yt")
 
         sort_col1, sort_col2 = st.columns([1, 3])
         with sort_col1:
@@ -1118,9 +1328,9 @@ elif page == "📊 통계":
         SELECT SUBSTR(decision_date, 1, 4) as year, COUNT(*) as cnt
         FROM cases
         WHERE length(decision_date) >= 4
-          AND CAST(SUBSTR(decision_date, 1, 4) AS INTEGER) BETWEEN 1950 AND 2025
+          AND CAST(SUBSTR(decision_date, 1, 4) AS INTEGER) BETWEEN 1950 AND ?
         GROUP BY year ORDER BY year
-    """)
+    """, (CURRENT_YEAR,))
     if yearly:
         df_year = pd.DataFrame(yearly)
         df_year.columns = ["연도", "건수"]

@@ -1,0 +1,9 @@
+# 데이터 수집·재가공 파이프라인 재실행 시에만 필요한 의존성.
+# 앱만 실행할 경우 requirements.txt 만으로 충분하다.
+-r requirements.txt
+
+requests>=2.32,<3
+datasets>=2.14,<4
+
+# generate_explanations.py(선택: 쉬운 설명 생성)에서만 사용한다.
+anthropic>=0.40,<1

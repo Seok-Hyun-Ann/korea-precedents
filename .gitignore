@@ -38,8 +38,10 @@ env/
 .DS_Store
 Thumbs.db
 
-# ── 임시 / 로그 ──
+# ── 임시 / 로그 / 작업 문서 ──
 *.log
+*.pdf
+deep-research-report.md
 data/analysis_temp*.txt
 
 # ── 이미지 작업 원본 (README용 스크린샷은 docs/images에 커밋) ──
